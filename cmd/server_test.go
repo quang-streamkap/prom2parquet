@@ -37,7 +37,6 @@ func TestServerRun(t *testing.T) {
 		"kill": {
 			operations: func(s *promserver) { close(s.killChannel) },
 			expectedLogEntries: []string{
-				"server failed",
 				"flushing all data files",
 				"shutting down",
 			},

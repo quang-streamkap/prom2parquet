@@ -9,9 +9,13 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage/remote"
@@ -19,6 +23,35 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/acrlabs/prom2parquet/pkg/parquet"
+)
+
+// Prometheus metrics
+var (
+	requestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "prom2parquet_requests_total",
+		Help: "Total number of requests received",
+	}, []string{"endpoint", "status"})
+
+	samplesReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "prom2parquet_samples_received_total",
+		Help: "Total number of samples received",
+	})
+
+	timeseriesReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "prom2parquet_timeseries_received_total",
+		Help: "Total number of timeseries received",
+	})
+
+	activeWriters = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "prom2parquet_active_writers",
+		Help: "Number of active parquet writers",
+	})
+
+	requestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "prom2parquet_request_duration_seconds",
+		Help:    "Request duration in seconds",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"endpoint"})
 )
 
 const (
@@ -35,6 +68,10 @@ type promserver struct {
 	m            sync.RWMutex
 	flushChannel chan os.Signal
 	killChannel  chan os.Signal
+
+	// Health state
+	isReady   atomic.Bool
+	startTime time.Time
 }
 
 func newServer(opts *options) *promserver {
@@ -42,15 +79,25 @@ func newServer(opts *options) *promserver {
 	mux := http.NewServeMux()
 
 	s := &promserver{
-		httpserv: &http.Server{Addr: fulladdr, Handler: mux, ReadHeaderTimeout: 10 * time.Second},
-		opts:     opts,
-		channels: map[string]chan prompb.TimeSeries{},
+		httpserv:  &http.Server{Addr: fulladdr, Handler: mux, ReadHeaderTimeout: 10 * time.Second},
+		opts:      opts,
+		channels:  map[string]chan prompb.TimeSeries{},
+		startTime: time.Now(),
 
 		flushChannel: make(chan os.Signal, 1),
 		killChannel:  make(chan os.Signal, 1),
 	}
+
+	// Data endpoints
 	mux.HandleFunc("/receive", s.metricsReceive)
 	mux.HandleFunc("/flush", s.flushData)
+
+	// Health endpoints
+	mux.HandleFunc("/health", s.healthCheck)
+	mux.HandleFunc("/ready", s.readinessCheck)
+
+	// Prometheus metrics endpoint
+	mux.Handle("/metrics", promhttp.Handler())
 
 	return s
 }
@@ -61,17 +108,20 @@ func (self *promserver) run() {
 	endChannel := make(chan struct{}, 1)
 
 	go func() {
-		if err := self.httpserv.ListenAndServe(); err != nil {
+		if err := self.httpserv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Errorf("server failed: %v", err)
 		}
 	}()
 
 	go func() {
 		<-self.killChannel
+		self.isReady.Store(false)
 		self.handleShutdown()
 		close(endChannel)
 	}()
 
+	// Mark server as ready
+	self.isReady.Store(true)
 	log.Infof("server listening on %s", self.httpserv.Addr)
 	<-endChannel
 }
@@ -97,16 +147,29 @@ func (self *promserver) handleShutdown() {
 }
 
 func (self *promserver) metricsReceive(w http.ResponseWriter, req *http.Request) {
+	timer := prometheus.NewTimer(requestDuration.WithLabelValues("receive"))
+	defer timer.ObserveDuration()
+
 	body, err := remote.DecodeWriteRequest(req.Body)
 	if err != nil {
+		requestsTotal.WithLabelValues("receive", "error").Inc()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
+	// Count timeseries and samples
+	timeseriesReceived.Add(float64(len(body.Timeseries)))
+	for _, ts := range body.Timeseries {
+		samplesReceived.Add(float64(len(ts.Samples)))
+	}
+
 	if err := self.sendTimeseries(req.Context(), body.Timeseries); err != nil {
+		requestsTotal.WithLabelValues("receive", "error").Inc()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	requestsTotal.WithLabelValues("receive", "success").Inc()
 }
 
 func (self *promserver) sendTimeseries(ctx context.Context, timeserieses []prompb.TimeSeries) (err error) {
@@ -157,7 +220,11 @@ func (self *promserver) spawnWriter(ctx context.Context, channelName string) (ch
 	ch := make(chan prompb.TimeSeries)
 	self.channels[channelName] = ch
 
-	go writer.Listen(ch) //nolint:contextcheck // the req context and the backend creation context should be separate
+	activeWriters.Inc()
+	go func() {
+		writer.Listen(ch) //nolint:contextcheck // the req context and the backend creation context should be separate
+		activeWriters.Dec()
+	}()
 
 	return ch, nil
 }
@@ -171,11 +238,13 @@ func (self *promserver) flushData(w http.ResponseWriter, req *http.Request) {
 	}{}
 
 	if err := d.Decode(&flushReq); err != nil {
+		requestsTotal.WithLabelValues("flush", "error").Inc()
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	if flushReq.Prefix == nil {
+		requestsTotal.WithLabelValues("flush", "error").Inc()
 		http.Error(w, "missing field 'prefix' in JSON object", http.StatusBadRequest)
 		return
 	}
@@ -186,4 +255,47 @@ func (self *promserver) flushData(w http.ResponseWriter, req *http.Request) {
 			close(ch)
 		}
 	}
+	requestsTotal.WithLabelValues("flush", "success").Inc()
+}
+
+// healthCheck handles liveness probe requests
+func (self *promserver) healthCheck(w http.ResponseWriter, req *http.Request) {
+	requestsTotal.WithLabelValues("health", "success").Inc()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	response := map[string]interface{}{
+		"status":  "healthy",
+		"uptime":  time.Since(self.startTime).String(),
+		"version": "1.0.0",
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// readinessCheck handles readiness probe requests
+func (self *promserver) readinessCheck(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if !self.isReady.Load() {
+		requestsTotal.WithLabelValues("ready", "not_ready").Inc()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "not_ready",
+			"reason": "server is shutting down or not yet initialized",
+		})
+		return
+	}
+
+	self.m.RLock()
+	writerCount := len(self.channels)
+	self.m.RUnlock()
+
+	requestsTotal.WithLabelValues("ready", "success").Inc()
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":         "ready",
+		"active_writers": writerCount,
+		"backend_root":   self.opts.backendRoot,
+	})
 }

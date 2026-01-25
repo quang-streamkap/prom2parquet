@@ -8,6 +8,7 @@ replace github.com/xitongsys/parquet-go => github.com/drmorr0/parquet-go v1.7.0
 
 require (
 	github.com/jonboulle/clockwork v0.4.0
+	github.com/prometheus/client_golang v1.18.0
 	github.com/prometheus/common v0.47.0
 	github.com/prometheus/prometheus v0.49.1
 	github.com/samber/lo v1.39.0
@@ -84,7 +85,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/prometheus/client_golang v1.18.0 // indirect
 	github.com/prometheus/client_model v0.5.0 // indirect
 	github.com/prometheus/common/sigv4 v0.1.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
