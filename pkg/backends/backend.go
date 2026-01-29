@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	log "github.com/sirupsen/logrus"
 	"github.com/thediveo/enumflag/v2"
 	"github.com/xitongsys/parquet-go-source/local"
@@ -22,6 +25,26 @@ const (
 
 	S3
 )
+
+// s3Client is a cached S3 client for reuse
+var s3Client *s3.Client
+
+// initS3Client initializes the S3 client with proper credential chain
+func initS3Client(ctx context.Context) (*s3.Client, error) {
+	if s3Client != nil {
+		return s3Client, nil
+	}
+
+	// Load AWS config using default credential chain (supports IRSA, env vars, etc.)
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	s3Client = s3.NewFromConfig(cfg)
+	log.Infof("initialized S3 client with region: %s", cfg.Region)
+	return s3Client, nil
+}
 
 func ConstructBackendForFile( //nolint:ireturn // this is fine
 	root,
@@ -62,9 +85,27 @@ func ConstructBackendForFile( //nolint:ireturn // this is fine
 		return fw, nil
 
 	case S3:
-		log.Infof("using S3 backend, writing to s3://%s/%s", root, file)
+		// root format: "bucket-name/prefix" or just "bucket-name"
+		// file format: "path/to/file.parquet"
+		// We need to split root into bucket and prefix, then combine prefix with file for the key
+		bucket := root
+		key := file
+		if idx := strings.Index(root, "/"); idx != -1 {
+			bucket = root[:idx]
+			prefix := root[idx+1:]
+			key = prefix + "/" + file
+		}
 
-		fw, err := s3v2.NewS3FileWriter(context.Background(), root, file, nil)
+		log.Infof("using S3 backend, writing to s3://%s/%s", bucket, key)
+
+		ctx := context.Background()
+		client, err := initS3Client(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("can't initialize S3 client: %w", err)
+		}
+
+		// Pass the properly configured S3 client to the writer
+		fw, err := s3v2.NewS3FileWriterWithClient(ctx, client, bucket, key, nil)
 		if err != nil {
 			return nil, fmt.Errorf("can't create S3 writer: %w", err)
 		}
