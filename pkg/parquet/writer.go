@@ -3,6 +3,7 @@ package parquet
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jonboulle/clockwork"
@@ -117,7 +118,9 @@ func (self *Prom2ParquetWriter) listen(
 
 func (self *Prom2ParquetWriter) createBackendWriter() error {
 	basename := self.now().Truncate(self.flushInterval).Format("20060102150405")
-	self.currentFile = fmt.Sprintf("%s/%s.parquet", self.prefix, basename)
+	// Trim leading slash from prefix to avoid double slashes in S3 path
+	prefix := strings.TrimPrefix(self.prefix, "/")
+	self.currentFile = fmt.Sprintf("%s/%s.parquet", prefix, basename)
 
 	fw, err := backends.ConstructBackendForFile(self.root, self.currentFile, self.backend)
 	if err != nil {
